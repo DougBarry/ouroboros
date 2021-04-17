@@ -1,4 +1,5 @@
 from time import sleep
+from datetime import datetime, timedelta
 from logging import getLogger
 from docker import DockerClient, tls
 from os.path import isdir, isfile, join
@@ -182,6 +183,10 @@ class Container(BaseImageObject):
             tag = f'{tag}:latest'
         return self._pull(tag)
 
+    def history(self, image):
+        """Docker image history"""
+        return self._history(image)
+
     # Filters
     def running_filter(self):
         """Return running container objects list, except ouroboros itself"""
@@ -255,16 +260,46 @@ class Container(BaseImageObject):
 
             try:
                 latest_image = self.pull(current_tag)
-            except ConnectionError:
+            except Error:
+                self.logger.error("Issue detecting %s's image tag. Skipping...", container.name)
+                continue
+
+            latest_image_dts = 0
+            latest_image_history = None
+
+            if current_image.id == latest_image.id:
+                self.logger.debug(f"Container {container.name} is up to date.")
                 continue
 
             try:
-                if current_image.id != latest_image.id:
-                    updateable.append((container, current_image, latest_image))
-                else:
-                    continue
-            except AttributeError:
-                self.logger.error("Issue detecting %s's image tag. Skipping...", container.name)
+                latest_image_history = latest_image.history()
+            except AttributeError as e:
+                self.logger.debug(f"Unable to retrieve latest image history for {container.name}, ignoring.")
+                latest_image_history = None
+                continue
+                
+            if latest_image_history:
+                # Is the image old enough for us to update to?
+                for info in latest_image_history:
+                    if info['Tags']:
+                        if 'latest' in str(info['Tags'][0]):
+                            latest_image_dts = datetime.utcfromtimestamp(int(info['Created']))
+                            break
+                    else:
+                        continue
+
+            # if latest_image_dts == 0:
+            #     self.logger.info("Unable to determine age of latest image version. Assuming update required.")
+
+            latest_image_age = datetime.now() - latest_image_dts
+            image_minimum_age = int(container.labels.get('com.couroboros.minimum_age', 0))
+            self.logger.debug(f"New image {container.name} is {latest_image_age.seconds}s old.")
+            if latest_image_age > timedelta(seconds=image_minimum_age):
+                # New image is old enough for us to want to update to
+                self.logger.info(f"Image age greater than {image_minimum_age}s. Considering candidate for update.")
+                updateable.append((container, current_image, latest_image))
+            else:
+                self.logger.debug(f"Image not old enough to be a candidate for update.")
 
             # Get container list to restart after update complete
             depends_on = container.labels.get('com.ouroboros.depends_on', False)
